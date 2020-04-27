@@ -1,0 +1,563 @@
+diff --git a/Makefile b/Makefile
+index 911dd8d..4cc1ba3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -182,6 +182,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_lsnd\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -251,7 +252,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
++	printf.c umalloc.c lsnd.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+diff --git a/defs.h b/defs.h
+index 528b359..a432d6e 100644
+--- a/defs.h
++++ b/defs.h
+@@ -34,6 +34,13 @@ int             fileread(struct file*, char*, int n);
+ int             filestat(struct file*, struct stat*);
+ int             filewrite(struct file*, char*, int n);
+ 
++int             getFreeFds(void);
++int             getUniqueInodeFds(void);
++int             getWriteableFds(void);
++int             getReadableFds(void);
++int             getTotalNumberOfRefs(void);
++int             getNumberOfUsedFds(void);
++
+ // fs.c
+ void            readsb(int dev, struct superblock *sb);
+ int             dirlink(struct inode*, char*, uint);
+@@ -53,11 +60,18 @@ int             readi(struct inode*, char*, uint, uint);
+ void            stati(struct inode*, struct stat*);
+ int             writei(struct inode*, char*, uint, uint);
+ 
++int             inodeinfo(char* buffer);
++
+ // ide.c
+ void            ideinit(void);
+ void            ideintr(void);
+ void            iderw(struct buf*);
+ 
++int             getNumWaitingOperations(void);
++int             getNumReadWaitingOperations(void);
++int             getNumWriteWaitingOperations(void);
++void            getWorkingBlocks(char* ans);
++
+ // ioapic.c
+ void            ioapicenable(int irq, int cpu);
+ extern uchar    ioapicid;
+@@ -121,8 +135,14 @@ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
+ 
++int             PIDname(char* buffer);
++int             PIDstatus (char* buffer);
++
+ // procfs.c
+ void            procfsinit(void);
++void            itoa(int num, char* s);
++void            appendStrToBuffer(char* buffer, char* str);
++void            appendNumToBuffer(char* buffer, int num);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/file.c b/file.c
+index 24b32c2..af29254 100644
+--- a/file.c
++++ b/file.c
+@@ -155,3 +155,78 @@ filewrite(struct file *f, char *addr, int n)
+   panic("filewrite");
+ }
+ 
++int getFreeFds(){
++    int ans = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        if(f->ref == 0)
++            ans++;
++    }
++    //release(&ftable.lock);
++    return ans;
++}
++
++int getUniqueInodeFds(){
++    int ans = 0;
++    int inums[200];
++    for(int i = 0; i < 200; i++)
++        inums[i] = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        if(inums[f->ip->inum] == 0){
++            inums[f->ip->inum] = 1;
++            ans++;
++        }
++    }
++    //release(&ftable.lock);
++    return ans;
++}
++
++int getWriteableFds(){
++    int ans = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        if(f->writable == 1)
++            ans++;
++    }
++    //release(&ftable.lock);
++    return ans;
++}
++
++int getReadableFds(){
++    int ans = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        if(f->readable == 1)
++            ans++;
++    }
++    //release(&ftable.lock);
++    return ans;
++}
++
++int getTotalNumberOfRefs(){
++    int ans = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        ans+=f->ref;
++    }
++    //release(&ftable.lock);
++    return ans;
++}
++
++int getNumberOfUsedFds(){
++    int ans = 0;
++    struct file *f;
++    //acquire(&ftable.lock);
++    for(f = ftable.file; f < ftable.file + NFILE; f++){
++        if(f->ref > 0)
++            ans++;
++    }
++    //release(&ftable.lock);
++    return ans;
++}
+diff --git a/fs.c b/fs.c
+index 870d7bf..542c69f 100644
+--- a/fs.c
++++ b/fs.c
+@@ -21,6 +21,7 @@
+ #include "buf.h"
+ #include "file.h"
+ 
++
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ static void itrunc(struct inode*);
+ // there should be one superblock per disk device, but we run with
+@@ -677,3 +678,43 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++int inodeinfo(char* buffer){
++    struct inode *ip;
++    for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++){
++        if(ip->ref == 0)
++            continue;
++        appendStrToBuffer(buffer, "\nDevice: ");
++        appendNumToBuffer(buffer, ip->dev);
++        appendStrToBuffer(buffer, "\nInode number: ");
++        appendNumToBuffer(buffer, ip->inum);
++        appendStrToBuffer(buffer, "\nis valid: ");
++        appendNumToBuffer(buffer, ip->valid);
++        appendStrToBuffer(buffer, "\ntype: ");
++        switch(ip->type){
++            case T_DIR:
++                appendStrToBuffer(buffer, "T_DIR");
++                break;
++            case T_FILE:
++                appendStrToBuffer(buffer, "T_FILE");
++                break;
++            case T_DEV:
++                appendStrToBuffer(buffer, "T_DEV");
++                break;
++        }
++        appendStrToBuffer(buffer, "\nmajor minor: <");
++        appendNumToBuffer(buffer, ip->major);
++        appendStrToBuffer(buffer, " , ");
++        appendNumToBuffer(buffer, ip->minor);
++        appendStrToBuffer(buffer, ">");
++        appendStrToBuffer(buffer, "\nhard links: ");
++        appendNumToBuffer(buffer, ip->nlink);
++        appendStrToBuffer(buffer, "\nblocks used: ");
++        if(ip->size % 512 == 0)
++            appendNumToBuffer(buffer, ip->size/512);
++        else
++            appendNumToBuffer(buffer, ip->size/512 + 1);
++        appendStrToBuffer(buffer, "\n");
++    }
++    return 0;
++}
+diff --git a/ide.c b/ide.c
+index b4c0b1f..29d0982 100644
+--- a/ide.c
++++ b/ide.c
+@@ -166,3 +166,39 @@ iderw(struct buf *b)
+ 
+   release(&idelock);
+ }
++
++int getNumWaitingOperations(){
++    int ans = 0;
++    struct buf **pp;
++    for(pp=&idequeue; *pp; pp=&(*pp)->qnext)
++        ans++;
++    return ans;
++}
++
++int getNumReadWaitingOperations(){
++    int ans = 0;
++    struct buf **pp;
++    for(pp=&idequeue; *pp; pp=&(*pp)->qnext)
++        if(((*pp)->flags & B_VALID) == 0)
++            ans++;
++    return ans;
++}
++
++int getNumWriteWaitingOperations(){
++    int ans = 0;
++    struct buf **pp;
++    for(pp=&idequeue; *pp; pp=&(*pp)->qnext)
++        if(((*pp)->flags & B_DIRTY) != 0)
++            ans++;
++    return ans;
++}
++
++void getWorkingBlocks(char* ans){
++    struct buf **pp;
++    for(pp=&idequeue; *pp; pp=&(*pp)->qnext){
++        appendNumToBuffer(ans, (*pp)->dev);
++        appendStrToBuffer(ans, ",");
++        appendNumToBuffer(ans, (*pp)->blockno);
++        appendStrToBuffer(ans, ";");
++    }
++}
+diff --git a/lsnd.c b/lsnd.c
+new file mode 100644
+index 0000000..ec65a32
+--- /dev/null
++++ b/lsnd.c
+@@ -0,0 +1,99 @@
++
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fs.h"
++
++
++
++
++
++char* turnToSanityFormat(char* text, char* buff){
++    
++    char* oldBuff;
++    oldBuff= buff;
++    
++    char *tmp;
++    char *newline;
++ //   char buf[256];
++    tmp = text;
++    int count;
++
++    tmp = strchr( tmp, ':');
++
++    while(tmp){
++        tmp =tmp+ 2;
++        newline = strchr(tmp, '\n');
++        memmove(buff, tmp, newline - tmp); //entering to buf
++        count++;
++        buff = buff +(int)(newline - tmp);
++        memmove(buff, (char*)' ', 1);
++        buff++;
++        
++        if(count == 5){ //starting major
++          memmove(buff, (char*)'(', 1);
++          buff ++;
++        }
++        printf(1, buff);
++        if(count == 5){ //ending major
++            memmove(buff, (char*)')', 1);
++            buff++;
++        }
++       // printf(1, " ");
++    }        
++    
++        
++        
++        
++               return oldBuff;
++        
++        
++    }
++
++
++
++int main() {
++       
++
++   // char* buffer = "Hello my name is : kk \n hey : ksks";
++  //  char bu[256];
++   // turnToSanityFormat(buffer, bu);
++   // printf(1,bu);
++   // char [] buffer = "Hello my name is : kk \n hey : ksks";
++    
++    
++    int fd, inodeinfo_fd;
++    char readBuff[512], filename[50];
++    struct dirent dir_entry;
++    
++        char buf[256];
++
++    
++    if ((inodeinfo_fd = open("/proc/inodeinfo", 0)) < 0) {
++        printf(1, "error in opening info\n");
++        exit();
++    }
++    read(inodeinfo_fd, &dir_entry, sizeof(dir_entry)); // reading: .
++//    read(inodeinfo_fd, &dir_entry, sizeof(dir_entry)); // reading: ..
++    //icacche
++    while (read(inodeinfo_fd, &dir_entry, sizeof(dir_entry)) == sizeof(dir_entry)) {// read inode at a time
++      if(dir_entry.inum != 0){
++       // sprintf(filename, "/proc/inodeinfo/%s", dir_entry.name);
++        fd = open(filename,0);
++        if(fd >= 0){
++          if (read(fd, readBuff, 512) <= 0) {
++              printf(2, "error in reading inode file!\n");
++              return -1;
++          }
++          turnToSanityFormat(readBuff, buf);
++          printf(1, buf);
++          memset(buf,0,256);
++          printf(1, "\n");
++          close(fd);
++        }
++      }
++    }
++    close(inodeinfo_fd);
++
++    return 0;
++}
+diff --git a/proc.c b/proc.c
+index 806b1b1..0b13e23 100644
+--- a/proc.c
++++ b/proc.c
+@@ -20,6 +20,42 @@ extern void trapret(void);
+ 
+ static void wakeup1(void *chan);
+ 
++int PIDname(char* buffer){
++    appendStrToBuffer(buffer, "process name: ");
++    appendStrToBuffer(buffer, myproc()->name);
++    appendStrToBuffer(buffer, "\n");
++    return strlen(buffer);
++}
++
++int PIDstatus (char* buffer){
++    appendStrToBuffer(buffer, "process state: ");
++    switch(myproc()->state){
++        case UNUSED:
++            appendStrToBuffer(buffer, "UNUSED");
++            break;
++        case EMBRYO:
++            appendStrToBuffer(buffer, "EMBRYO");
++            break;
++        case SLEEPING:
++            appendStrToBuffer(buffer, "SLEEPING");
++            break;
++        case RUNNABLE:
++            appendStrToBuffer(buffer, "RUNNABLE");
++            break;
++        case RUNNING:
++            appendStrToBuffer(buffer, "RUNNING");
++            break;
++        case ZOMBIE:
++            appendStrToBuffer(buffer, "ZOMBIE");
++            break;
++    }
++    
++    appendStrToBuffer(buffer, "\nprocess size: ");
++    appendNumToBuffer(buffer, myproc()->sz);
++    appendStrToBuffer(buffer, "\n");
++    return strlen(buffer);
++}
++///////////////////////
+ void
+ pinit(void)
+ {
+diff --git a/procfs.c b/procfs.c
+index 8cb06cc..83b713b 100644
+--- a/procfs.c
++++ b/procfs.c
+@@ -12,23 +12,126 @@
+ #include "proc.h"
+ #include "x86.h"
+ 
++int ninodes = 0;
++
++void itoa(int num, char* s){
++    int len = 0;
++    if (num == 0){
++        s[0] = '0';
++        return;
++    }
++    while(num != 0){
++        s[len] = num % 10 + '0';
++        num = num / 10; 
++        len++;
++    }
++    for(int i = 0; i < len/2; i++){
++        char tmp = s[i];
++        s[i] = s[len - 1 - i];
++        s[len - 1 - i] = tmp;
++    }
++}
++
++void appendStrToBuffer(char* buffer, char* str){
++  int strLen = strlen(str);
++  int bufLen = strlen(buffer);
++  memmove(buffer + bufLen, str, strLen);
++}
++
++void appendNumToBuffer(char* buffer, int num){
++  char numStr[16] = {0};
++  itoa(num, numStr);
++  appendStrToBuffer(buffer, numStr);
++}
++
++int procideinfo(char* buffer){
++    appendStrToBuffer(buffer, "Waiting operations: ");
++    appendNumToBuffer(buffer, getNumWaitingOperations());
++    appendStrToBuffer(buffer, "Read waiting operations: ");
++    appendNumToBuffer(buffer, getNumReadWaitingOperations());
++    appendStrToBuffer(buffer, "Write waiting operations: ");
++    appendNumToBuffer(buffer, getNumWriteWaitingOperations());
++    appendStrToBuffer(buffer, "Working blocks: ");
++    char ans[512] = {};
++    getWorkingBlocks(ans);
++    appendStrToBuffer(buffer, ans);
++    return strlen(buffer);
++}
++
++int procfilestat(char* buffer){
++    appendStrToBuffer(buffer, "Free fds: ");
++    appendNumToBuffer(buffer, getFreeFds());
++    appendStrToBuffer(buffer, "Unique inode fds: ");
++    appendNumToBuffer(buffer, getUniqueInodeFds());
++    appendStrToBuffer(buffer, "Writeable fds: ");
++    appendNumToBuffer(buffer, getWriteableFds());
++    appendStrToBuffer(buffer, "Readable fds: ");
++    appendNumToBuffer(buffer, getReadableFds());
++    appendStrToBuffer(buffer, "Refs per fds: ");
++    appendNumToBuffer(buffer, getTotalNumberOfRefs());
++    appendStrToBuffer(buffer, " / ");
++    appendNumToBuffer(buffer, getNumberOfUsedFds());
++    return strlen(buffer);
++}
++
++/*
++int PIDname(char* buffer){}
++int PIDstatus (char* buffer){}
++*/
++
++int map(struct inode *ip, char* buffer){
++    if (ip->inum == (ninodes+1))  //1 direct
++            return procideinfo(buffer);
++    if (ip->inum == (ninodes+2))
++           return procfilestat(buffer);
++   
++    //TODO: map inodeinfo & PID directories
++    return 0;
++}
++
++
+ int 
+ procfsisdir(struct inode *ip) {
+-  return 0;
++    if (ninodes == 0){
++            struct superblock sb;
++    readsb(ip->dev, &sb);
++    ninodes = sb.ninodes;
++    }
++    if (!(ip->type == T_DEV) || !(ip->major == PROCFS))
++            return 0;
++    int inum = ip->inum;
++    if (inum == (ninodes+1) || inum == (ninodes+2))
++            return 0; //ideinfo and filestat are files (not directories)
++   //TODO return 1 for inodeinfo & PID directories
++   return 1;
+ }
+ 
+ void 
+ procfsiread(struct inode* dp, struct inode *ip) {
++  ip->valid = 1;
++  ip->type = T_DEV;
++  ip->major = PROCFS;
+ }
+ 
+ int
+ procfsread(struct inode *ip, char *dst, int off, int n) {
+-  return 0;
++    if (ninodes == 0){
++        struct superblock sb;
++        readsb(ip->dev, &sb);
++        ninodes = sb.ninodes;
++    }
++    char buf[NPROC+5] = {0};
++    int size = map(ip, buf);
++    memmove(dst, buf+off, n);
++    if(n < size - off)
++        return n;
++    return size - off;
+ }
+ 
+ int
+ procfswrite(struct inode *ip, char *buf, int n)
+ {
++  panic("procfs - call to write in a read-only system");
+   return 0;
+ }
+ 
+diff --git a/string.c b/string.c
+index a7cc61f..9a196c3 100644
+--- a/string.c
++++ b/string.c
+@@ -103,3 +103,4 @@ strlen(const char *s)
+   return n;
+ }
+ 
++
+diff --git a/sysfile.c b/sysfile.c
+index 87e508b..ac691ae 100644
+--- a/sysfile.c
++++ b/sysfile.c
+@@ -382,7 +382,7 @@ sys_chdir(void)
+     return -1;
+   }
+   ilock(ip);
+-  if(ip->type != T_DIR){
++  if(ip->type != T_DIR /**/&& !IS_DEV_DIR(ip)/**/){
+     iunlockput(ip);
+     end_op();
+     return -1;
